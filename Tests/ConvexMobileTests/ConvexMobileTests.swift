@@ -1,3 +1,5 @@
+import Combine
+import Foundation
 import XCTest
 
 @testable import ConvexMobile
@@ -235,6 +237,250 @@ final class ConvexMobileTests: XCTestCase {
     XCTAssertNil(error)
   }
 
+  func testSubscriptionDeliversUpdateBeforeHandleResolves() async throws {
+    let receivedValue = expectation(description: "received synchronous subscription update")
+    let ffiClient = FakeMobileConvexClient(
+      controlledSubscriptions: true, updateBeforeSubscriptionReturns: true)
+    let client = ConvexMobile.ConvexClient(ffiClient: ffiClient)
+    var result: Message?
+
+    let cancellable = client.subscribe(to: "cached", yielding: Message.self)
+      .sink(
+        receiveCompletion: { _ in },
+        receiveValue: { value in
+          result = value
+          receivedValue.fulfill()
+        })
+
+    await fulfillment(of: [receivedValue], timeout: 0.5)
+    cancellable.cancel()
+
+    XCTAssertEqual(result?.id, "the_id")
+    XCTAssertEqual(result?.val, 42)
+  }
+
+  func testSubscriptionRaceConcurrentCallbacksAndCancellation() async throws {
+    let iterationCount = 2_000
+    let ffiClient = FakeMobileConvexClient(controlledSubscriptions: true)
+    let client = ConvexMobile.ConvexClient(ffiClient: ffiClient)
+    let receivedValues = LockedValue(0)
+    let valuesReceivedAfterCancel = LockedValue(0)
+    let cancellationReturned = LockedValue(Array(repeating: false, count: iterationCount))
+    var cancellables: [AnyCancellable] = []
+    cancellables.reserveCapacity(iterationCount)
+
+    for index in 0..<iterationCount {
+      let name = String(format: "race-%04d", index)
+      let cancellable = client.subscribe(to: name, yielding: Message.self)
+        .receive(on: DispatchQueue.main)
+        .map { value in
+          Just(value)
+            .setFailureType(to: ClientError.self)
+            .eraseToAnyPublisher()
+        }
+        .switchToLatest()
+        .sink(
+          receiveCompletion: { _ in },
+          receiveValue: { _ in
+            receivedValues.withValue { $0 += 1 }
+            if cancellationReturned.withValue({ $0[index] }) {
+              valuesReceivedAfterCancel.withValue { $0 += 1 }
+            }
+          })
+      cancellables.append(cancellable)
+    }
+
+    guard await waitUntil({ ffiClient.subscriptionCount == iterationCount }) else {
+      XCTFail("Timed out waiting for all race subscriptions to start")
+      return
+    }
+
+    let subscribers = ffiClient.capturedSubscribers
+    let handles = ffiClient.subscriptionHandles
+    XCTAssertEqual(subscribers.count, iterationCount)
+    XCTAssertEqual(handles.count, iterationCount)
+
+    // Prove every Future has resolved and FlatMap has subscribed to its HandleEvents publisher
+    // before racing Rust-style callbacks against downstream cancellation.
+    for subscriber in subscribers {
+      subscriber.onUpdate(value: FakeMobileConvexClient.messageJSON)
+    }
+    guard await waitUntil(timeout: 5, { receivedValues.value == iterationCount }) else {
+      XCTFail("Timed out waiting for all race subscriptions to become active")
+      return
+    }
+
+    DispatchQueue.concurrentPerform(iterations: iterationCount * 3) { operation in
+      let index = operation / 3
+      switch operation % 3 {
+      case 0:
+        subscribers[index].onUpdate(value: FakeMobileConvexClient.messageJSON)
+      case 1:
+        subscribers[index].onError(message: "race error", value: nil)
+      default:
+        cancellables[index].cancel()
+        cancellationReturned.withValue { $0[index] = true }
+      }
+    }
+
+    // Exercise callbacks that originate strictly after every cancel() call has returned.
+    DispatchQueue.concurrentPerform(iterations: iterationCount) { index in
+      subscribers[index].onUpdate(value: FakeMobileConvexClient.messageJSON)
+    }
+    try await Task.sleep(nanoseconds: 100_000_000)
+
+    let incorrectlyCancelled = handles.filter { $0.cancelCount != 1 }
+    XCTAssertTrue(
+      incorrectlyCancelled.isEmpty,
+      "Expected every raced subscription handle to be cancelled exactly once; "
+        + "\(incorrectlyCancelled.count) of \(iterationCount) were not")
+    XCTAssertEqual(
+      valuesReceivedAfterCancel.value, 0,
+      "Values were delivered after downstream cancellation returned")
+  }
+
+  func testSubscriptionCancelBeforeHandleResolvesCancelsExactlyOnce() async throws {
+    let resolutionGate = SubscriptionResolutionGate()
+    let ffiClient = FakeMobileConvexClient(
+      controlledSubscriptions: true,
+      subscriptionResolutionGate: resolutionGate)
+    let client = ConvexMobile.ConvexClient(ffiClient: ffiClient)
+
+    let cancellable = client.subscribe(to: "delayed", yielding: Message.self)
+      .sink(receiveCompletion: { _ in }, receiveValue: { _ in })
+
+    cancellable.cancel()
+
+    guard await waitUntil({ ffiClient.subscriptionCount == 1 }) else {
+      XCTFail("Timed out waiting for delayed subscription to start")
+      return
+    }
+    let handle = try XCTUnwrap(ffiClient.subscriptionHandles.first)
+
+    resolutionGate.resolve()
+    _ = await waitUntil(timeout: 0.5, { handle.cancelCount == 1 })
+
+    XCTAssertEqual(
+      handle.cancelCount, 1,
+      "A subscription cancelled before initialization completed leaked its server handle")
+  }
+
+  func testSubscriptionCancelIsExactlyOnceAcrossCancellationPaths() async throws {
+    let ffiClient = FakeMobileConvexClient(controlledSubscriptions: true)
+    let client = ConvexMobile.ConvexClient(ffiClient: ffiClient)
+    let activeValues = LockedValue(0)
+
+    let activeCancellable = client.subscribe(to: "active", yielding: Message.self)
+      .sink(
+        receiveCompletion: { _ in },
+        receiveValue: { _ in activeValues.withValue { $0 += 1 } })
+
+    guard await waitUntil({ ffiClient.subscriptionCount == 1 }) else {
+      XCTFail("Timed out waiting for active subscription")
+      return
+    }
+    let activeSubscriber = ffiClient.capturedSubscribers[0]
+    let activeHandle = ffiClient.subscriptionHandles[0]
+    guard await publishUntilReceived(activeSubscriber, receivedValues: activeValues) else {
+      XCTFail("Timed out activating subscription")
+      return
+    }
+
+    activeCancellable.cancel()
+    activeCancellable.cancel()
+    XCTAssertEqual(activeHandle.cancelCount, 1, "Double cancel must cancel the handle only once")
+
+    let errorCompletion = expectation(description: "subscription error")
+    let erroredValues = LockedValue(0)
+    let erroredCancellable = client.subscribe(to: "errored", yielding: Message.self)
+      .sink(
+        receiveCompletion: { completion in
+          if case .failure = completion {
+            errorCompletion.fulfill()
+          }
+        },
+        receiveValue: { _ in erroredValues.withValue { $0 += 1 } })
+
+    guard await waitUntil({ ffiClient.subscriptionCount == 2 }) else {
+      XCTFail("Timed out waiting for errored subscription")
+      return
+    }
+    let erroredSubscriber = ffiClient.capturedSubscribers[1]
+    let erroredHandle = ffiClient.subscriptionHandles[1]
+    guard await publishUntilReceived(erroredSubscriber, receivedValues: erroredValues) else {
+      XCTFail("Timed out activating errored subscription")
+      return
+    }
+
+    erroredSubscriber.onError(message: "server error", value: nil)
+    await fulfillment(of: [errorCompletion], timeout: 2)
+    erroredCancellable.cancel()
+    erroredCancellable.cancel()
+    _ = await waitUntil(timeout: 0.5, { erroredHandle.cancelCount == 1 })
+
+    XCTAssertEqual(
+      erroredHandle.cancelCount, 1,
+      "Error completion must release the server handle, and later cancel must not release it twice")
+  }
+
+  func testSubscriptionRaceDoesNotDeliverValuesAfterCancelReturns() async throws {
+    let ffiClient = FakeMobileConvexClient(controlledSubscriptions: true)
+    let client = ConvexMobile.ConvexClient(ffiClient: ffiClient)
+    let receivedValues = LockedValue(0)
+    let cancellationReturned = LockedValue(false)
+    let valuesReceivedAfterCancel = LockedValue(0)
+
+    let cancellable = client.subscribe(to: "delivery", yielding: Message.self)
+      .receive(on: DispatchQueue.main)
+      .map { value in
+        Just(value)
+          .setFailureType(to: ClientError.self)
+          .eraseToAnyPublisher()
+      }
+      .switchToLatest()
+      .sink(
+        receiveCompletion: { _ in },
+        receiveValue: { _ in
+          receivedValues.withValue { $0 += 1 }
+          if cancellationReturned.value {
+            valuesReceivedAfterCancel.withValue { $0 += 1 }
+          }
+        })
+
+    guard await waitUntil({ ffiClient.subscriptionCount == 1 }) else {
+      XCTFail("Timed out waiting for delivery subscription")
+      return
+    }
+    let subscriber = ffiClient.capturedSubscribers[0]
+    guard await publishUntilReceived(subscriber, receivedValues: receivedValues) else {
+      XCTFail("Timed out activating delivery subscription")
+      return
+    }
+
+    let callbacksStarted = DispatchSemaphore(value: 0)
+    let allowPostCancelCallbacks = DispatchSemaphore(value: 0)
+    let callbacksFinished = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+      callbacksStarted.signal()
+      allowPostCancelCallbacks.wait()
+      DispatchQueue.concurrentPerform(iterations: 2_000) { _ in
+        subscriber.onUpdate(value: FakeMobileConvexClient.messageJSON)
+      }
+      callbacksFinished.signal()
+    }
+
+    callbacksStarted.wait()
+    cancellable.cancel()
+    cancellationReturned.withValue { $0 = true }
+    allowPostCancelCallbacks.signal()
+    callbacksFinished.wait()
+    try await Task.sleep(nanoseconds: 100_000_000)
+
+    XCTAssertEqual(
+      valuesReceivedAfterCancel.value, 0,
+      "The sink received values produced after cancel() returned")
+  }
+
   func testMutationRoundTrip() async throws {
     let fakeFfiClient = FakeMobileConvexClient()
     let client = ConvexMobile.ConvexClient(ffiClient: fakeFfiClient)
@@ -456,10 +702,71 @@ final class ConvexMobileTests: XCTestCase {
     // Verify the auth callback provider was cleared and state is unauthenticated
     XCTAssertNil(fakeFfiClient.authProvider)
   }
+
+  private func waitUntil(
+    timeout: TimeInterval = 2,
+    _ condition: @escaping () -> Bool
+  ) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+      if condition() {
+        return true
+      }
+      try? await Task.sleep(nanoseconds: 1_000_000)
+    }
+    return condition()
+  }
+
+  private func publishUntilReceived(
+    _ subscriber: any UniFFI.QuerySubscriber,
+    receivedValues: LockedValue<Int>
+  ) async -> Bool {
+    let initialCount = receivedValues.value
+    let deadline = Date().addingTimeInterval(2)
+    while Date() < deadline {
+      subscriber.onUpdate(value: FakeMobileConvexClient.messageJSON)
+      if receivedValues.value > initialCount {
+        return true
+      }
+      try? await Task.sleep(nanoseconds: 1_000_000)
+    }
+    return receivedValues.value > initialCount
+  }
 }
 
 class FakeMobileConvexClient: UniFFI.MobileConvexClientProtocol {
-  var cancellationCount = 0
+  static let messageJSON =
+    "{\"_id\": \"the_id\", \"val\": {\"$integer\":\"KgAAAAAAAAA=\"}, \"extra\": null}"
+
+  private struct CapturedSubscription {
+    let name: String
+    let subscriber: any UniFFI.QuerySubscriber
+    let handle: FakeSubscriptionHandle
+  }
+
+  private let subscriptionLock = NSLock()
+  private var capturedSubscriptions: [CapturedSubscription] = []
+  private var storedCancellationCount = 0
+  private let controlledSubscriptions: Bool
+  private let subscriptionResolutionGate: SubscriptionResolutionGate?
+  private let updateBeforeSubscriptionReturns: Bool
+
+  var cancellationCount: Int {
+    subscriptionLock.withLock { storedCancellationCount }
+  }
+
+  var subscriptionCount: Int {
+    subscriptionLock.withLock { capturedSubscriptions.count }
+  }
+
+  var capturedSubscribers: [any UniFFI.QuerySubscriber] {
+    sortedCapturedSubscriptions().map(\.subscriber)
+  }
+
+  var subscriptionHandles: [FakeSubscriptionHandle] {
+    sortedCapturedSubscriptions().map(\.handle)
+  }
+
   var subscriptionArgs: [String: String] = [:]
   var mutationCalls: [String] = []
   var actionCalls: [String] = []
@@ -469,9 +776,28 @@ class FakeMobileConvexClient: UniFFI.MobileConvexClientProtocol {
   var setAuthExpectation: XCTestExpectation?
   var setAuthCallbackExpectation: XCTestExpectation?
 
-  init(initialAuth: String? = nil, resultPublished: XCTestExpectation? = nil) {
+  init(
+    initialAuth: String? = nil,
+    resultPublished: XCTestExpectation? = nil,
+    controlledSubscriptions: Bool = false,
+    subscriptionResolutionGate: SubscriptionResolutionGate? = nil,
+    updateBeforeSubscriptionReturns: Bool = false
+  ) {
     self.auth = initialAuth
     self.resultPublished = resultPublished
+    self.controlledSubscriptions = controlledSubscriptions
+    self.subscriptionResolutionGate = subscriptionResolutionGate
+    self.updateBeforeSubscriptionReturns = updateBeforeSubscriptionReturns
+  }
+
+  fileprivate func recordCancellation() {
+    subscriptionLock.withLock { storedCancellationCount += 1 }
+  }
+
+  private func sortedCapturedSubscriptions() -> [CapturedSubscription] {
+    subscriptionLock.withLock {
+      capturedSubscriptions.sorted { $0.name < $1.name }
+    }
   }
 
   func action(name: String, args: [String: String]) async throws -> String {
@@ -516,6 +842,24 @@ class FakeMobileConvexClient: UniFFI.MobileConvexClientProtocol {
     async throws -> UniFFI.SubscriptionHandle
   {
     subscriptionArgs = args
+    let handle = FakeSubscriptionHandle(client: self)
+    subscriptionLock.withLock {
+      capturedSubscriptions.append(
+        CapturedSubscription(name: name, subscriber: subscriber, handle: handle))
+    }
+
+    if updateBeforeSubscriptionReturns {
+      subscriber.onUpdate(value: Self.messageJSON)
+    }
+
+    if let subscriptionResolutionGate {
+      await subscriptionResolutionGate.waitUntilResolved()
+    }
+
+    if controlledSubscriptions {
+      return handle
+    }
+
     let _ = Task {
       try await Task.sleep(nanoseconds: UInt64(0.05 * 1_000_000_000))
       if name == "typeMismatch" {
@@ -539,7 +883,7 @@ class FakeMobileConvexClient: UniFFI.MobileConvexClientProtocol {
       resultPublished?.fulfill()
 
     }
-    return FakeSubscriptionHandle(client: self)
+    return handle
   }
 
 }
@@ -578,7 +922,14 @@ class FakeAuthProvider: AuthProvider {
 }
 
 class FakeSubscriptionHandle: UniFFI.SubscriptionHandle {
-  let client: FakeMobileConvexClient
+  private let cancellationLock = NSLock()
+  private var storedCancelCount = 0
+  private weak var client: FakeMobileConvexClient?
+
+  var cancelCount: Int {
+    cancellationLock.withLock { storedCancelCount }
+  }
+
   init(client: FakeMobileConvexClient) {
     self.client = client
     super.init(noPointer: UniFFI.SubscriptionHandle.NoPointer())
@@ -589,7 +940,64 @@ class FakeSubscriptionHandle: UniFFI.SubscriptionHandle {
   }
 
   override func cancel() {
-    self.client.cancellationCount += 1
+    cancellationLock.withLock { storedCancelCount += 1 }
+    client?.recordCancellation()
+  }
+}
+
+private final class LockedValue<Value>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage: Value
+
+  init(_ value: Value) {
+    storage = value
+  }
+
+  var value: Value {
+    lock.withLock { storage }
+  }
+
+  @discardableResult
+  func withValue<Result>(_ body: (inout Value) throws -> Result) rethrows -> Result {
+    lock.lock()
+    defer { lock.unlock() }
+    return try body(&storage)
+  }
+}
+
+final class SubscriptionResolutionGate: @unchecked Sendable {
+  private let lock = NSLock()
+  private var isResolved = false
+  private var continuations: [CheckedContinuation<Void, Never>] = []
+
+  func waitUntilResolved() async {
+    await withCheckedContinuation { continuation in
+      lock.lock()
+      if isResolved {
+        lock.unlock()
+        continuation.resume()
+      } else {
+        continuations.append(continuation)
+        lock.unlock()
+      }
+    }
+  }
+
+  func resolve() {
+    let pendingContinuations: [CheckedContinuation<Void, Never>]
+    lock.lock()
+    guard !isResolved else {
+      lock.unlock()
+      return
+    }
+    isResolved = true
+    pendingContinuations = continuations
+    continuations.removeAll()
+    lock.unlock()
+
+    for continuation in pendingContinuations {
+      continuation.resume()
+    }
   }
 }
 

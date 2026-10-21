@@ -16,6 +16,8 @@ import Foundation
 public class ConvexClient {
   let ffiClient: UniFFI.MobileConvexClientProtocol
   fileprivate let webSocketStateAdapter = WebSocketStateAdapter()
+  private let subscriptionQueue = DispatchQueue(label: "dev.convex.ConvexMobile.subscriptions")
+  private let subscriptionQueueKey = DispatchSpecificKey<Void>()
 
   /// Creates a new instance of ``ConvexClient``.
   ///
@@ -24,10 +26,12 @@ public class ConvexClient {
   public init(deploymentUrl: String) {
     self.ffiClient = UniFFI.MobileConvexClient(
       deploymentUrl: deploymentUrl, clientId: "swift-\(convexMobileVersion)", webSocketStateSubscriber: webSocketStateAdapter)
+    subscriptionQueue.setSpecific(key: subscriptionQueueKey, value: ())
   }
 
   init(ffiClient: UniFFI.MobileConvexClientProtocol) {
     self.ffiClient = ffiClient
+    subscriptionQueue.setSpecific(key: subscriptionQueueKey, value: ())
   }
 
   /// Subscribes to the query with the given `name` and converts data from the subscription into an
@@ -44,41 +48,39 @@ public class ConvexClient {
   public func subscribe<T: Decodable>(
     to name: String, with args: [String: ConvexEncodable?]? = nil, yielding output: T.Type? = nil
   ) -> AnyPublisher<T, ClientError> {
-    // There are two steps to producing the final Publisher in this method.
-    // 1. Subscribe to the data from Convex and publish the subscription handle
-    // 2. Feed the subscription handle into the Convex data Publisher so it can cancel the upstream
-    //    subscription when downstream subscribers are done consuming data
-
-    // This Publisher will ultimately publish the data received from Convex.
-    let convexPublisher = PassthroughSubject<T, ClientError>()
-    let adapter = SubscriptionAdapter<T>(publisher: convexPublisher)
-
-    // This Publisher is responsible for initializing the Convex subscription and returning a handle
-    // to the upstream (Convex) subscription.
-    let initializationPublisher = Future<SubscriptionHandle, ClientError> {
-      result in
-      Task {
-        do {
-          let subscriptionHandle = try await self.ffiClient.subscribe(
-            name: name,
-            args: args?.mapValues({ v in
-              try v?.convexEncode() ?? "null"
-            }) ?? [:], subscriber: adapter)
-          result(.success(subscriptionHandle))
-        } catch {
-          result(.failure(ClientError.InternalError(msg: error.localizedDescription)))
-        }
-      }
+    Deferred {
+      let convexPublisher = PassthroughSubject<T, ClientError>()
+      let lifecycle = SubscriptionLifecycle()
+      let adapter = SubscriptionAdapter<T>(
+        publisher: convexPublisher, queue: self.subscriptionQueue, lifecycle: lifecycle)
+      let scheduler = SubscriptionScheduler(
+        queue: self.subscriptionQueue, queueKey: self.subscriptionQueueKey)
+      return convexPublisher
+        .handleEvents(
+          receiveSubscription: { _ in
+            // Start only after the subject has installed its downstream subscription.
+            Task {
+              do {
+                let subscriptionHandle = try await self.ffiClient.subscribe(
+                  name: name,
+                  args: args?.mapValues({ v in
+                    try v?.convexEncode() ?? "null"
+                  }) ?? [:], subscriber: adapter)
+                let handleBox = SubscriptionHandleBox(subscriptionHandle)
+                self.subscriptionQueue.async {
+                  lifecycle.resolve(handleBox.handle)
+                }
+              } catch {
+                adapter.onInternalError(message: error.localizedDescription)
+              }
+            }
+          },
+          receiveCompletion: { _ in lifecycle.finish() },
+          receiveCancel: { lifecycle.finish() })
+        // Subscribe and cancel synchronously with native callbacks to close cancellation races.
+        .subscribe(on: scheduler)
+        .eraseToAnyPublisher()
     }
-
-    // The final Publisher takes the handle from the initial Convex subscription and supplies it to
-    // the data publisher so it can cancel the upstream subscription when consumers are no longer
-    // listening for data.
-    return initializationPublisher.flatMap({ subscriptionHandle in
-      convexPublisher.handleEvents(receiveCancel: {
-        subscriptionHandle.cancel()
-      })
-    })
     .eraseToAnyPublisher()
   }
 
@@ -354,13 +356,99 @@ public class ConvexClientWithAuth<T>: ConvexClient {
   private typealias LoginStrategy = (@Sendable @escaping (String?) -> Void) async throws -> T
 }
 
-private class SubscriptionAdapter<T: Decodable>: QuerySubscriber {
+private final class SubscriptionLifecycle: @unchecked Sendable {
+  private enum State {
+    case pending
+    case active(SubscriptionHandle)
+    case finished
+  }
+
+  private var state = State.pending
+
+  // All lifecycle transitions happen on the client's subscription queue.
+  func resolve(_ handle: SubscriptionHandle) {
+    switch state {
+    case .pending:
+      state = .active(handle)
+    case .active:
+      preconditionFailure("Subscription handle resolved more than once")
+    case .finished:
+      handle.cancel()
+    }
+  }
+
+  func finish() {
+    switch state {
+    case .pending:
+      state = .finished
+    case .active(let handle):
+      // Keep the handle in state until native cancellation has returned.
+      handle.cancel()
+      state = .finished
+    case .finished:
+      break
+    }
+  }
+}
+
+private final class SubscriptionHandleBox: @unchecked Sendable {
+  let handle: SubscriptionHandle
+
+  init(_ handle: SubscriptionHandle) {
+    self.handle = handle
+  }
+}
+
+private struct SubscriptionScheduler: Scheduler {
+  typealias SchedulerTimeType = DispatchQueue.SchedulerTimeType
+  typealias SchedulerOptions = DispatchQueue.SchedulerOptions
+
+  let queue: DispatchQueue
+  let queueKey: DispatchSpecificKey<Void>
+  var now: SchedulerTimeType { queue.now }
+  var minimumTolerance: SchedulerTimeType.Stride { queue.minimumTolerance }
+
+  func schedule(options: SchedulerOptions?, _ action: @escaping () -> Void) {
+    // sync prevents values after cancel returns; inline execution avoids re-entrant deadlock.
+    if DispatchQueue.getSpecific(key: queueKey) != nil {
+      action()
+    } else {
+      queue.sync(execute: action)
+    }
+  }
+
+  func schedule(
+    after date: SchedulerTimeType,
+    tolerance: SchedulerTimeType.Stride,
+    options: SchedulerOptions?,
+    _ action: @escaping () -> Void
+  ) {
+    queue.schedule(after: date, tolerance: tolerance, options: options, action)
+  }
+
+  func schedule(
+    after date: SchedulerTimeType,
+    interval: SchedulerTimeType.Stride,
+    tolerance: SchedulerTimeType.Stride,
+    options: SchedulerOptions?,
+    _ action: @escaping () -> Void
+  ) -> Cancellable {
+    queue.schedule(
+      after: date, interval: interval, tolerance: tolerance, options: options, action)
+  }
+}
+
+private final class SubscriptionAdapter<T: Decodable>: QuerySubscriber, @unchecked Sendable {
   typealias Publisher = PassthroughSubject<T, ClientError>
 
   let publisher: Publisher
+  let queue: DispatchQueue
+  let lifecycle: SubscriptionLifecycle
 
-  init(publisher: Publisher) {
+  init(publisher: Publisher, queue: DispatchQueue, lifecycle: SubscriptionLifecycle) {
     self.publisher = publisher
+    self.queue = queue
+    self.lifecycle = lifecycle
   }
 
   func onError(message: String, value: String?) {
@@ -370,16 +458,28 @@ private class SubscriptionAdapter<T: Decodable>: QuerySubscriber {
     } else {
       err = ClientError.ServerError(msg: message)
     }
-    publisher.send(
-      completion: Subscribers.Completion.failure(err))
+    sendFailure(err)
+  }
+
+  func onInternalError(message: String) {
+    sendFailure(ClientError.InternalError(msg: message))
   }
 
   func onUpdate(value: String) {
     do {
-      publisher.send(try JSONDecoder().decode(Publisher.Output.self, from: Data(value.utf8)))
+      let output = try JSONDecoder().decode(Publisher.Output.self, from: Data(value.utf8))
+      queue.async {
+        self.publisher.send(output)
+      }
     } catch {
-      publisher.send(
-        completion: .failure(ClientError.InternalError(msg: error.localizedDescription)))
+      onInternalError(message: error.localizedDescription)
+    }
+  }
+
+  private func sendFailure(_ error: ClientError) {
+    queue.async {
+      self.lifecycle.finish()
+      self.publisher.send(completion: .failure(error))
     }
   }
 }
