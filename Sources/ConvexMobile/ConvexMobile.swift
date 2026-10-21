@@ -16,8 +16,6 @@ import Foundation
 public class ConvexClient {
   let ffiClient: UniFFI.MobileConvexClientProtocol
   fileprivate let webSocketStateAdapter = WebSocketStateAdapter()
-  private let subscriptionQueue = DispatchQueue(label: "dev.convex.ConvexMobile.subscriptions")
-  private let subscriptionQueueKey = DispatchSpecificKey<Void>()
 
   /// Creates a new instance of ``ConvexClient``.
   ///
@@ -26,12 +24,10 @@ public class ConvexClient {
   public init(deploymentUrl: String) {
     self.ffiClient = UniFFI.MobileConvexClient(
       deploymentUrl: deploymentUrl, clientId: "swift-\(convexMobileVersion)", webSocketStateSubscriber: webSocketStateAdapter)
-    subscriptionQueue.setSpecific(key: subscriptionQueueKey, value: ())
   }
 
   init(ffiClient: UniFFI.MobileConvexClientProtocol) {
     self.ffiClient = ffiClient
-    subscriptionQueue.setSpecific(key: subscriptionQueueKey, value: ())
   }
 
   /// Subscribes to the query with the given `name` and converts data from the subscription into an
@@ -49,34 +45,40 @@ public class ConvexClient {
     to name: String, with args: [String: ConvexEncodable?]? = nil, yielding output: T.Type? = nil
   ) -> AnyPublisher<T, ClientError> {
     Deferred {
+      let subscriptionQueue = DispatchQueue(label: "dev.convex.ConvexMobile.subscription")
+      let subscriptionQueueKey = DispatchSpecificKey<Void>()
+      subscriptionQueue.setSpecific(key: subscriptionQueueKey, value: ())
       let convexPublisher = PassthroughSubject<T, ClientError>()
       let lifecycle = SubscriptionLifecycle()
       let adapter = SubscriptionAdapter<T>(
-        publisher: convexPublisher, queue: self.subscriptionQueue, lifecycle: lifecycle)
+        publisher: convexPublisher, queue: subscriptionQueue, lifecycle: lifecycle)
       let scheduler = SubscriptionScheduler(
-        queue: self.subscriptionQueue, queueKey: self.subscriptionQueueKey)
+        queue: subscriptionQueue, queueKey: subscriptionQueueKey)
       return convexPublisher
         .handleEvents(
-          receiveSubscription: { _ in
-            // Start only after the subject has installed its downstream subscription.
-            Task {
-              do {
-                let subscriptionHandle = try await self.ffiClient.subscribe(
-                  name: name,
-                  args: args?.mapValues({ v in
-                    try v?.convexEncode() ?? "null"
-                  }) ?? [:], subscriber: adapter)
-                let handleBox = SubscriptionHandleBox(subscriptionHandle)
-                self.subscriptionQueue.async {
-                  lifecycle.resolve(handleBox.handle)
+          receiveCompletion: { _ in lifecycle.finish() },
+          receiveCancel: { lifecycle.finish() },
+          receiveRequest: { demand in
+            guard demand > .none else { return }
+            lifecycle.startIfNeeded {
+              // Demand is forwarded before queued native callbacks can publish a value.
+              Task {
+                do {
+                  let subscriptionHandle = try await self.ffiClient.subscribe(
+                    name: name,
+                    args: args?.mapValues({ v in
+                      try v?.convexEncode() ?? "null"
+                    }) ?? [:], subscriber: adapter)
+                  let handleBox = SubscriptionHandleBox(subscriptionHandle)
+                  subscriptionQueue.async {
+                    lifecycle.resolve(handleBox.handle)
+                  }
+                } catch {
+                  adapter.onInternalError(message: error.localizedDescription)
                 }
-              } catch {
-                adapter.onInternalError(message: error.localizedDescription)
               }
             }
-          },
-          receiveCompletion: { _ in lifecycle.finish() },
-          receiveCancel: { lifecycle.finish() })
+          })
         // Subscribe and cancel synchronously with native callbacks to close cancellation races.
         .subscribe(on: scheduler)
         .eraseToAnyPublisher()
@@ -364,8 +366,16 @@ private final class SubscriptionLifecycle: @unchecked Sendable {
   }
 
   private var state = State.pending
+  private var started = false
 
-  // All lifecycle transitions happen on the client's subscription queue.
+  // All lifecycle transitions happen on this subscription's queue.
+  func startIfNeeded(_ start: () -> Void) {
+    guard !started else { return }
+    if case .finished = state { return }
+    started = true
+    start()
+  }
+
   func resolve(_ handle: SubscriptionHandle) {
     switch state {
     case .pending:
@@ -410,6 +420,8 @@ private struct SubscriptionScheduler: Scheduler {
 
   func schedule(options: SchedulerOptions?, _ action: @escaping () -> Void) {
     // sync prevents values after cancel returns; inline execution avoids re-entrant deadlock.
+    // Delivery-path operators before receive(on:) must never block on the main thread because
+    // subscribe and cancel synchronize onto this queue from their caller's thread.
     if DispatchQueue.getSpecific(key: queueKey) != nil {
       action()
     } else {

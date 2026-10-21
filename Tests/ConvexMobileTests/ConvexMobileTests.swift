@@ -259,6 +259,37 @@ final class ConvexMobileTests: XCTestCase {
     XCTAssertEqual(result?.val, 42)
   }
 
+  func testSubscriptionValuesDeliversSynchronousFirstUpdate() async throws {
+    let readCount = 300
+    let receivedValues = expectation(description: "received every synchronous first update")
+    receivedValues.expectedFulfillmentCount = readCount
+    let successfulReads = LockedValue(0)
+    let ffiClient = FakeMobileConvexClient(
+      controlledSubscriptions: true, updateBeforeSubscriptionReturns: true)
+    let client = ConvexMobile.ConvexClient(ffiClient: ffiClient)
+
+    let reads = (0..<readCount).map { index in
+      Task {
+        var iterator = client.subscribe(
+          to: "cached-values-\(index)", yielding: Message.self
+        ).values.makeAsyncIterator()
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        if let value = try? await iterator.next(), value.val == 42 {
+          successfulReads.withValue { $0 += 1 }
+          receivedValues.fulfill()
+        }
+      }
+    }
+
+    await fulfillment(of: [receivedValues], timeout: 3)
+    reads.forEach { $0.cancel() }
+    for read in reads {
+      _ = await read.result
+    }
+
+    XCTAssertEqual(successfulReads.value, readCount)
+  }
+
   func testSubscriptionRaceConcurrentCallbacksAndCancellation() async throws {
     let iterationCount = 2_000
     let ffiClient = FakeMobileConvexClient(controlledSubscriptions: true)
